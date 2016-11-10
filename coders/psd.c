@@ -1843,6 +1843,31 @@ static MagickBooleanType ReadPSDLayersInternal(Image *image,
   return(status);
 }
 
+static int expectedNonAlphaChannels(const PSDInfo * psd_info)
+{
+	switch (psd_info->mode)
+	{
+	case CMYKMode:
+		return 4;
+	case BitmapMode:
+	case GrayscaleMode:
+	case DuotoneMode:
+		return 1;
+	default:
+		return 3;
+	}
+}
+
+static int getChannelsToRead(const PSDInfo * psd_info, Image * image)
+{
+	int result=expectedNonAlphaChannels(psd_info);
+	if (image->matte == MagickTrue)
+		result += 1;
+	if (result > psd_info->channels)
+		result = psd_info->channels;
+	return result;
+}
+
 ModuleExport MagickBooleanType ReadPSDLayers(Image *image,
   const ImageInfo *image_info,const PSDInfo *psd_info,
   const MagickBooleanType skip_layers,ExceptionInfo *exception)
@@ -1876,7 +1901,9 @@ static MagickBooleanType ReadPSDMergedImage(const ImageInfo *image_info,
   register ssize_t
     i;
 
-  compression=(PSDCompressionType) ReadBlobMSBShort(image);
+  int channelsToRead = getChannelsToRead(psd_info, image);
+
+  compression =(PSDCompressionType) ReadBlobMSBShort(image);
   image->compression=ConvertPSDCompression(compression);
 
   if (compression != Raw && compression != RLE)
@@ -1896,7 +1923,7 @@ static MagickBooleanType ReadPSDMergedImage(const ImageInfo *image_info,
     }
 
   status=MagickTrue;
-  for (i=0; i < (ssize_t) psd_info->channels; i++)
+  for (i=0; i < (ssize_t) channelsToRead; i++)
   {
     if (compression == RLE)
       status=ReadPSDChannelRLE(image,psd_info,i,sizes+(i*image->rows),
@@ -1929,7 +1956,8 @@ static Image *ReadPSDImage(const ImageInfo *image_info,ExceptionInfo *exception)
 
   MagickBooleanType
     has_merged_image,
-    skip_layers;
+    skip_layers,
+	has_color_map = MagickFalse;
 
   MagickOffsetType
     offset;
@@ -2023,7 +2051,6 @@ static Image *ReadPSDImage(const ImageInfo *image_info,ExceptionInfo *exception)
   if (psd_info.mode == CMYKMode)
     {
       SetImageColorspace(image,CMYKColorspace);
-      image->matte=psd_info.channels > 4 ? MagickTrue : MagickFalse;
     }
   else if ((psd_info.mode == BitmapMode) || (psd_info.mode == GrayscaleMode) ||
            (psd_info.mode == DuotoneMode))
@@ -2035,10 +2062,8 @@ static Image *ReadPSDImage(const ImageInfo *image_info,ExceptionInfo *exception)
         (void) LogMagickEvent(CoderEvent,GetMagickModule(),
           "  Image colormap allocated");
       SetImageColorspace(image,GRAYColorspace);
-      image->matte=psd_info.channels > 1 ? MagickTrue : MagickFalse;
     }
-  else
-    image->matte=psd_info.channels > 3 ? MagickTrue : MagickFalse;
+
   /*
     Read PSD raster colormap only present for indexed and duotone images.
   */
@@ -2082,7 +2107,7 @@ static Image *ReadPSDImage(const ImageInfo *image_info,ExceptionInfo *exception)
           for (i=0; i < (ssize_t) image->colors; i++)
             image->colormap[i].blue=ScaleCharToQuantum((unsigned char)
               ReadBlobByte(image));
-          image->matte=MagickFalse;
+		  has_color_map=MagickFalse;
         }
     }
   if ((image->depth == 1) && (image->storage_class != PseudoClass))
@@ -2136,6 +2161,18 @@ static Image *ReadPSDImage(const ImageInfo *image_info,ExceptionInfo *exception)
           "  read composite only");
       skip_layers=MagickTrue;
     }
+
+  image->matte=MagickFalse;
+  if (skip_layers == MagickFalse && has_color_map == MagickFalse)
+    {
+      /* 
+	     If we are processing all layers, set the matte (alpha) flag if there are appear
+	     to be alpha channels. This logic is probably flawed because user-defined extra channels
+	     aren't used for rendering in Photoshop.
+	  */
+	  image->matte=psd_info.channels > expectedNonAlphaChannels(&psd_info) ? MagickTrue : MagickFalse;
+    }
+
   if (length == 0)
     {
       if (image->debug != MagickFalse)
@@ -2144,6 +2181,11 @@ static Image *ReadPSDImage(const ImageInfo *image_info,ExceptionInfo *exception)
     }
   else
     {
+      /*
+         As a side effect, ReadPSDLayers will set the matte flag if the high order bit
+	     is set in the number of layers. This happens even if we are not processing all
+		 layers.
+	  */
       if (ReadPSDLayersInternal(image,image_info,&psd_info,skip_layers,
             exception) != MagickTrue)
         {
